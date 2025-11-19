@@ -1,0 +1,246 @@
+version: '3.8'
+
+services:
+  #--- Orders Service ---
+  orders-service:
+    build:
+      context: ./OrdersService
+      dockerfile: Dockerfile
+    container_name: orders_service_app
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=orders-db
+      - DB_PORT=5432
+      - DB_USERNAME=serdev
+      - DB_PASSWORD=nifer2030
+      - DB_DATABASE=orders_db
+      - JWT_SECRET=grupo8
+      - PORT=3000
+    depends_on:
+      - orders-db
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  orders-db:
+    image: postgres:16-alpine
+    container_name: orders_db_postgres
+    environment:
+      - POSTGRES_DB=orders_db
+      - POSTGRES_USER=serdev
+      - POSTGRES_PASSWORD=nifer2030
+    volumes:
+      - orders_postgres_data:/var/lib/postgresql/data
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  #--- User Service ---
+  user-service:
+    build:
+      context: ./UserService/user-service
+      dockerfile: Dockerfile
+    container_name: user_service_app
+    command: gunicorn user_service.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - ./UserService/user-service:/app
+      - static_volume:/app/staticfiles
+    env_file:
+      - ./UserService/user-service/.env
+    depends_on:
+      - user-db
+    labels:
+      - "co.elastic.logs/enabled=true"
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  user-db:
+    image: mysql:8.0
+    container_name: user_db_mysql
+    environment:
+      MYSQL_DATABASE: user_service
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_ROOT_PASSWORD: ''
+    volumes:
+      - user_mysql_data:/var/lib/mysql
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  #--- Nginx Reverse Proxy ---
+  nginx:
+    image: nginx:latest
+    container_name: reverse_proxy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+      - static_volume:/usr/share/nginx/html/static
+    depends_on:
+      - orders-service
+      - user-service
+      - catalogo-service
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  #--- Catalogo Service ---
+  catalogo-service:
+    build:
+      context: ./CatalogoSerice
+      dockerfile: Dockerfile
+    image: catalogo-service-dev
+    container_name: catalogo_app
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - ./CatalogoSerice/:/var/www
+    entrypoint: []
+    command: sh -c "composer install && php artisan migrate && php artisan serve --host=0.0.0.0 --port=8001"
+    depends_on:
+      - catalogo-db
+      - catalogo-redis
+    environment:
+      - DB_HOST=catalogo-db
+      - REDIS_HOST=catalogo-redis
+      - DB_PORT=3306
+    env_file:
+      - ./CatalogoSerice/.env.docker
+    networks:
+      - microservices-network
+
+
+
+  catalogo-db:
+    image: mysql:8.0
+    container_name: catalogo_db_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: db_catalogo
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_PASSWORD: password
+      MYSQL_USER: sail
+    volumes:
+      - catalogo_db_data:/var/lib/mysql
+    networks:
+      - microservices-network
+
+  catalogo-redis:
+    image: redis:alpine
+    container_name: catalogo_redis
+    restart: unless-stopped
+    networks:
+      - microservices-network
+
+  #--- GraphQL Gateway ---
+  graphql-gateway:
+    build:
+      context: ./GraphQLGateway
+      dockerfile: Dockerfile
+    container_name: graphql_gateway
+    ports:
+      - "4000:4000"
+    networks:
+      - microservices-network
+    depends_on:
+      - orders-service
+      - user-service
+      - catalogo-service
+      - payment-notifications-service
+    restart: unless-stopped
+
+  #--- Payment Notifications Service ---
+  payment-notifications-service:
+    build:
+      context: ./PaymentNotificationsService
+      dockerfile: Dockerfile
+    container_name: payment_notifications_app
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - EMAIL_USER=cuellarcocavaleriaalexandra@gmail.com # REPLACE WITH YOUR EMAIL
+      - EMAIL_PASSWORD=qnay trsk uckr gzvn # REPLACE WITH YOUR APP PASSWORD (generated from Google Account Security)
+    networks:
+      - microservices-network
+    depends_on:
+      - rabbitmq
+    restart: unless-stopped
+
+  #--- RabbitMQ Service ---
+  rabbitmq:
+    image: "rabbitmq:3-management"
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - microservices-network
+    restart: unless-stopped
+  
+  #--- ELK Stack for Logging ---
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    volumes:
+      - ./elk/logstash/pipeline/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    ports:
+      - "5044:5044"
+    depends_on:
+      - elasticsearch
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    container_name: filebeat
+    user: root
+    command: ["--strict.perms=false"]
+    volumes:
+      - ./elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - logstash
+      - kibana
+    networks:
+      - microservices-network
+    restart: unless-stopped
+
+volumes:
+  orders_postgres_data:
+  user_mysql_data:
+  static_volume:
+  catalogo_db_data:
+  esdata:
+
+networks:
+  microservices-network:
+    driver: bridge
